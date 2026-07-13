@@ -2,6 +2,8 @@ package updater
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,12 +90,27 @@ func xslateUbuntuUpstream(vuls []common.Vulnerability) []common.AppModuleVul {
 func fetchDistroVul() (bool, []*common.Vulnerability) {
 	log.Info()
 
-	status := true
-	var responseC = make(chan *FetcherResponse, 0)
+	parallelism := 2
+	if v := os.Getenv("FETCHER_PARALLELISM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			parallelism = n
+		}
+	}
+	if parallelism > len(fetchers) {
+		parallelism = len(fetchers)
+	}
+	log.WithField("parallelism", parallelism).Info("Distro fetcher parallelism")
 
-	// Fetch updates in parallel.
+	status := true
+	sem := make(chan struct{}, parallelism)
+	responseC := make(chan *FetcherResponse, len(fetchers))
+
+	// Fetch updates in parallel with concurrency limit.
 	for n, f := range fetchers {
 		go func(name string, fetcher Fetcher) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
 			response, err := fetcher.FetchUpdate()
 			if err != nil {
 				log.WithFields(log.Fields{"name": name, "error": err}).Error("Distro CVE update FAIL")
@@ -101,7 +118,6 @@ func fetchDistroVul() (bool, []*common.Vulnerability) {
 				responseC <- nil
 				return
 			}
-
 			responseC <- &response
 		}(n, f)
 	}

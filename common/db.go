@@ -10,7 +10,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/vul-dbgen/share"
+	utils "github.com/vul-dbgen/share"
 )
 
 const FirstYear = 2014
