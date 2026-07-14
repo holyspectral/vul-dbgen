@@ -61,6 +61,7 @@ type XzReader struct {
 type TarFileInfo struct {
 	Name string
 	Body []byte
+	Path string // mutually exclusive with Body; if set, content is streamed from disk
 }
 
 // NewXzReader shells out to a command line xz executable (if
@@ -409,7 +410,7 @@ func SelectivelyExtractModules(r io.Reader, lastfix string, maxFileSize int64) (
 	return data, nil
 }
 
-//func SelectivelyExtractToFile(r io.Reader, prefix string, toExtract []string, dir string) (map[string]string, error) {
+// func SelectivelyExtractToFile(r io.Reader, prefix string, toExtract []string, dir string) (map[string]string, error) {
 func SelectivelyExtractToFile(r io.Reader, selected func(string) bool, dir string) (map[string]string, error) {
 	files := make(map[string]string)
 

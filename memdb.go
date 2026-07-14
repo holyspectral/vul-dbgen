@@ -1,12 +1,15 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash"
+	"io"
 	"io/ioutil"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -79,54 +82,149 @@ func modFeaToFeaFull(fx common.FeatureVersion) common.FeaFull {
 	return v1fx
 }
 
-func splitDb(db *memDB, dbs *dbSpace) bool {
+func splitDb(db *memDB, dbs *dbSpace) (ok bool) {
 	if db.osVuls == nil {
-		return false
+		return
+	}
+
+	type nsFile struct {
+		indexF  *os.File
+		indexBW *bufio.Writer
+		indexW  io.Writer
+		indexH  hash.Hash
+		fullF   *os.File
+		fullBW  *bufio.Writer
+		fullW   io.Writer
+		fullH   hash.Hash
+	}
+
+	ns := make([]nsFile, dbMax)
+	// On any failure path, clean up all temp files whether still open in ns[] or
+	// already closed+stored in dbs.buffers. Calling Close/Remove on already-closed
+	// files or non-existent paths is safe (errors are ignored).
+	defer func() {
+		if ok {
+			return
+		}
+		for i := 0; i < dbMax; i++ {
+			if ns[i].indexF != nil {
+				ns[i].indexF.Close()
+				os.Remove(ns[i].indexF.Name())
+			}
+			if ns[i].fullF != nil {
+				ns[i].fullF.Close()
+				os.Remove(ns[i].fullF.Name())
+			}
+			if dbs.buffers[i].indexPath != "" {
+				os.Remove(dbs.buffers[i].indexPath)
+				dbs.buffers[i].indexPath = ""
+			}
+			if dbs.buffers[i].fullPath != "" {
+				os.Remove(dbs.buffers[i].fullPath)
+				dbs.buffers[i].fullPath = ""
+			}
+		}
+		if dbs.appPath != "" {
+			os.Remove(dbs.appPath)
+			dbs.appPath = ""
+		}
+	}()
+
+	for i := 0; i < dbMax; i++ {
+		indexF, err := os.CreateTemp("", "cvebuf-index-*.tb")
+		if err != nil {
+			log.WithError(err).Error("splitDb: create index temp file")
+			return
+		}
+		fullF, err := os.CreateTemp("", "cvebuf-full-*.tb")
+		if err != nil {
+			ns[i].indexF = indexF // let defer close+remove it
+			log.WithError(err).Error("splitDb: create full temp file")
+			return
+		}
+		indexH := sha256.New()
+		fullH := sha256.New()
+		indexBW := bufio.NewWriter(indexF)
+		fullBW := bufio.NewWriter(fullF)
+		ns[i] = nsFile{
+			indexF:  indexF,
+			indexBW: indexBW,
+			indexW:  io.MultiWriter(indexBW, indexH),
+			indexH:  indexH,
+			fullF:   fullF,
+			fullBW:  fullBW,
+			fullW:   io.MultiWriter(fullBW, fullH),
+			fullH:   fullH,
+		}
 	}
 
 	for _, v := range db.osVuls {
-		var buf *dbBuffer
+		idx := -1
 		for i := 0; i < dbMax; i++ {
 			if strings.Contains(v.Namespace, dbs.buffers[i].namespace) {
-				buf = &dbs.buffers[i]
+				idx = i
 				break
 			}
 		}
-
-		if buf == nil {
+		if idx < 0 {
 			log.Error("No known namespace found:", v.Namespace)
-			return false
+			return
 		}
-
 		vs := vulToShort(v)
-		b, err := json.Marshal(vs)
-		if err == nil {
-			buf.indexBuf.WriteString(fmt.Sprintf("%s\n", b))
+		if b, err := json.Marshal(vs); err == nil {
+			fmt.Fprintf(ns[idx].indexW, "%s\n", b)
 		}
-		b, err = json.Marshal(v)
-		if err == nil {
-			buf.fullBuf.WriteString(fmt.Sprintf("%s\n", b))
+		if b, err := json.Marshal(v); err == nil {
+			fmt.Fprintf(ns[idx].fullW, "%s\n", b)
 		}
 	}
 
 	for i := 0; i < dbMax; i++ {
-		buf := &dbs.buffers[i]
-		buf.indexSHA = sha256.Sum256(buf.indexBuf.Bytes())
-		buf.fullSHA = sha256.Sum256(buf.fullBuf.Bytes())
+		if err := ns[i].indexBW.Flush(); err != nil {
+			log.WithError(err).Error("splitDb: flush index buffer")
+			return
+		}
+		if err := ns[i].fullBW.Flush(); err != nil {
+			log.WithError(err).Error("splitDb: flush full buffer")
+			return
+		}
+		ns[i].indexF.Close()
+		ns[i].fullF.Close()
+		dbs.buffers[i].indexPath = ns[i].indexF.Name()
+		dbs.buffers[i].fullPath = ns[i].fullF.Name()
+		copy(dbs.buffers[i].indexSHA[:], ns[i].indexH.Sum(nil))
+		copy(dbs.buffers[i].fullSHA[:], ns[i].fullH.Sum(nil))
 	}
 
+	appF, err := os.CreateTemp("", "cvebuf-apps-*.tb")
+	if err != nil {
+		log.WithError(err).Error("splitDb: create apps temp file")
+		return
+	}
+	appH := sha256.New()
+	appBW := bufio.NewWriter(appF)
+	appMW := io.MultiWriter(appBW, appH)
 	for _, v := range db.appVuls {
-		if b, err := json.Marshal(&v); err == nil {
-			dbs.appBuf.WriteString(fmt.Sprintf("%s\n", b))
+		if b, err := json.Marshal(v); err == nil {
+			fmt.Fprintf(appMW, "%s\n", b)
 		}
 	}
-	dbs.appSHA = sha256.Sum256(dbs.appBuf.Bytes())
+	if err := appBW.Flush(); err != nil {
+		appF.Close()
+		os.Remove(appF.Name())
+		log.WithError(err).Error("splitDb: flush apps buffer")
+		return
+	}
+	appF.Close()
+	dbs.appPath = appF.Name()
+	copy(dbs.appSHA[:], appH.Sum(nil))
 
 	for i, v := range db.rawFiles {
 		dbs.rawSHA[i] = sha256.Sum256(v.Raw)
 	}
 
-	return true
+	ok = true
+	return
 }
 
 var rawFilenames []string = []string{
@@ -153,15 +251,15 @@ type dbBuffer struct {
 	namespace string
 	indexFile string
 	fullFile  string
-	indexBuf  bytes.Buffer
-	fullBuf   bytes.Buffer
+	indexPath string
+	fullPath  string
 	indexSHA  [sha256.Size]byte
 	fullSHA   [sha256.Size]byte
 }
 
 type dbSpace struct {
 	buffers [dbMax]dbBuffer
-	appBuf  bytes.Buffer
+	appPath string
 	appSHA  [sha256.Size]byte
 	rawSHA  [][sha256.Size]byte
 }
@@ -196,6 +294,10 @@ func (db *memDB) UpdateDb(version string) bool {
 
 	log.WithFields(log.Fields{"vuls": len(db.osVuls), "appVuls": len(db.appVuls)}).Info()
 
+	// All vuln data is now on disk; free the in-memory map before compress/encrypt.
+	db.osVuls = nil
+	runtime.GC()
+
 	var compactDB common.DBFile
 	var regularDB common.DBFile
 
@@ -220,10 +322,10 @@ func (db *memDB) UpdateDb(version string) bool {
 		var files []utils.TarFileInfo
 		for _, i := range []int{dbUbuntu, dbDebian, dbCentos, dbAlpine} {
 			buf := &dbs.buffers[i]
-			files = append(files, utils.TarFileInfo{buf.indexFile, buf.indexBuf.Bytes()})
-			files = append(files, utils.TarFileInfo{buf.fullFile, buf.fullBuf.Bytes()})
+			files = append(files, utils.TarFileInfo{Name: buf.indexFile, Path: buf.indexPath})
+			files = append(files, utils.TarFileInfo{Name: buf.fullFile, Path: buf.fullPath})
 		}
-		files = append(files, utils.TarFileInfo{"apps.tb", dbs.appBuf.Bytes()})
+		files = append(files, utils.TarFileInfo{Name: "apps.tb", Path: dbs.appPath})
 
 		compactDB.Filename = db.tbPath + common.CompactCVEDBName
 		compactDB.Key = keyVer
@@ -249,14 +351,14 @@ func (db *memDB) UpdateDb(version string) bool {
 		var files []utils.TarFileInfo
 		for i := 0; i < dbMax; i++ {
 			buf := &dbs.buffers[i]
-			files = append(files, utils.TarFileInfo{buf.indexFile, buf.indexBuf.Bytes()})
-			files = append(files, utils.TarFileInfo{buf.fullFile, buf.fullBuf.Bytes()})
-			log.WithFields(log.Fields{"database": buf.namespace, "size": buf.fullBuf.Len()}).Info()
+			files = append(files, utils.TarFileInfo{Name: buf.indexFile, Path: buf.indexPath})
+			files = append(files, utils.TarFileInfo{Name: buf.fullFile, Path: buf.fullPath})
+			log.WithFields(log.Fields{"database": buf.namespace}).Info()
 		}
-		files = append(files, utils.TarFileInfo{"apps.tb", dbs.appBuf.Bytes()})
-		log.WithFields(log.Fields{"database": "apps", "size": dbs.appBuf.Len()}).Info()
+		files = append(files, utils.TarFileInfo{Name: "apps.tb", Path: dbs.appPath})
+		log.WithFields(log.Fields{"database": "apps"}).Info()
 		for i, v := range db.rawFiles {
-			files = append(files, utils.TarFileInfo{v.Name, v.Raw})
+			files = append(files, utils.TarFileInfo{Name: v.Name, Body: v.Raw})
 			keyVer.Shas[v.Name] = fmt.Sprintf("%x", dbs.rawSHA[i])
 			log.WithFields(log.Fields{"database": v.Name, "size": len(v.Raw)}).Info()
 		}
@@ -266,8 +368,19 @@ func (db *memDB) UpdateDb(version string) bool {
 		regularDB.Files = files
 	}
 
+	defer func() {
+		for i := 0; i < dbMax; i++ {
+			os.Remove(dbs.buffers[i].indexPath)
+			os.Remove(dbs.buffers[i].fullPath)
+		}
+		os.Remove(dbs.appPath)
+	}()
+
 	for _, dbf := range []*common.DBFile{&compactDB, &regularDB} {
-		common.CreateDBFile(dbf)
+		if err := common.CreateDBFile(dbf); err != nil {
+			log.WithError(err).Error("CreateDBFile failed")
+			return false
+		}
 	}
 
 	return true

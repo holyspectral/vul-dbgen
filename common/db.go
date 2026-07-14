@@ -1,16 +1,17 @@
 package common
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"os"
 	"strconv"
 	"unicode"
 
 	log "github.com/sirupsen/logrus"
-
-	utils "github.com/vul-dbgen/share"
 )
 
 const FirstYear = 2014
@@ -20,29 +21,67 @@ func CreateDBFile(dbFile *DBFile) error {
 
 	header, _ := json.Marshal(dbFile.Key)
 
-	buf, err := utils.MakeTar(dbFile.Files)
-	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Error("Make tar file error")
+	// Stream tar directly into gzip — no separate uncompressed tar buffer.
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	tw := tar.NewWriter(gw)
+	for _, file := range dbFile.Files {
+		if err := func() error {
+			var size int64
+			if file.Path != "" {
+				info, err := os.Stat(file.Path)
+				if err != nil {
+					log.WithFields(log.Fields{"path": file.Path, "error": err}).Error("Stat temp file failed")
+					return err
+				}
+				size = info.Size()
+			} else {
+				size = int64(len(file.Body))
+			}
+			hdr := &tar.Header{
+				Name:     file.Name,
+				Mode:     0655,
+				Typeflag: '0',
+				Size:     size,
+			}
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			if file.Path != "" {
+				f, err := os.Open(file.Path)
+				if err != nil {
+					log.WithFields(log.Fields{"path": file.Path, "error": err}).Error("Open temp file failed")
+					return err
+				}
+				defer f.Close()
+				if _, err := io.Copy(tw, f); err != nil {
+					return err
+				}
+			} else {
+				if _, err := tw.Write(file.Body); err != nil {
+					return err
+				}
+			}
+			return nil
+		}(); err != nil {
+			return err
+		}
+	}
+	if err := tw.Close(); err != nil {
 		return err
 	}
-	zb := utils.GzipBytes(buf.Bytes())
+	if err := gw.Close(); err != nil {
+		return err
+	}
 
-	// Use local encrypt function
-	cipherData, err := encrypt(zb, getCVEDBEncryptKey())
+	cipherData, err := encrypt(gzBuf.Bytes(), getCVEDBEncryptKey())
+	gzBuf.Reset()
 	if err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Encrypt tar file fail")
 		return err
 	}
 
-	b0 := make([]byte, 0)
-	allb := bytes.NewBuffer(b0)
-
-	keyLen := int32(len(header))
-	binary.Write(allb, binary.BigEndian, &keyLen)
-	allb.Write(header)
-	allb.Write(cipherData)
-
-	// write to db file
+	// Write header + ciphertext directly to the output file — no intermediate buffer.
 	fdb, err := os.Create(dbFile.Filename)
 	if err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Create db file fail")
@@ -50,13 +89,22 @@ func CreateDBFile(dbFile *DBFile) error {
 	}
 	defer fdb.Close()
 
-	n, err := fdb.Write(allb.Bytes())
-	if err != nil || n != allb.Len() {
+	keyLen := int32(len(header))
+	if err := binary.Write(fdb, binary.BigEndian, &keyLen); err != nil {
+		return err
+	}
+	if _, err := fdb.Write(header); err != nil {
+		return err
+	}
+	if n, err := fdb.Write(cipherData); err != nil || n != len(cipherData) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		log.WithFields(log.Fields{"error": err}).Error("Write file error")
 		return err
 	}
 
-	log.WithFields(log.Fields{"file": dbFile.Filename, "size": allb.Len()}).Info("Create database done")
+	log.WithFields(log.Fields{"file": dbFile.Filename, "size": 4 + len(header) + len(cipherData)}).Info("Create database done")
 	return nil
 }
 
