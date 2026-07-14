@@ -22,5 +22,9 @@ import (
 type Datastore interface {
 	InsertVulnerabilities(vulnerabilities []*common.Vulnerability, appVuls []*common.AppModuleVul, rawFiles []*common.RawFile) error
 
+	// InsertDistroVulBatch inserts a batch of distro vulnerabilities into the DB.
+	// It is called repeatedly during streaming to avoid holding all vulns in RAM.
+	InsertDistroVulBatch(vuls []*common.Vulnerability) error
+
 	Close()
 }

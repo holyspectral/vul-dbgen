@@ -285,6 +285,19 @@ func memdbOpen(path string) (*memDB, error) {
 	return db, dbErr
 }
 
+func (db *memDB) InsertDistroVulBatch(vuls []*common.Vulnerability) error {
+	for _, v := range vuls {
+		vv1 := modVulToVulFull(v)
+		for _, fx := range v.FixedIn {
+			v1fx := modFeaToFeaFull(fx)
+			vv1.FixedIn = append(vv1.FixedIn, v1fx)
+		}
+		cveName := fmt.Sprintf("%s:%s", vv1.Namespace, vv1.Name)
+		db.osVuls[cveName] = vv1
+	}
+	return nil
+}
+
 func (db *memDB) InsertVulnerabilities(osVuls []*common.Vulnerability, appVuls []*common.AppModuleVul, rawFiles []*common.RawFile) error {
 	for _, v := range osVuls {
 		vv1 := modVulToVulFull(v)

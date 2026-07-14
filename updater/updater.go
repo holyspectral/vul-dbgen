@@ -1,8 +1,11 @@
 package updater
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -43,20 +46,19 @@ func IgnoreSeverity(s common.Priority) bool {
 func Update(datastore Datastore) bool {
 	log.Info("updating vulnerabilities")
 
-	// Fetch updates.
-	status, osVuls, appVuls, rawFiles := fetch(datastore)
+	// Distro vulns are streamed and inserted during fetch; only apps and raw
+	// files are returned here for the final InsertVulnerabilities call.
+	status, appVuls, rawFiles := fetch(datastore)
 	if !status {
 		log.WithFields(log.Fields{"status": status}).Error("Vulnerability update FAIL")
 		return false
 	}
 
-	// Insert vulnerabilities.
-	err := datastore.InsertVulnerabilities(osVuls, appVuls, rawFiles)
+	err := datastore.InsertVulnerabilities(nil, appVuls, rawFiles)
 	if err != nil {
 		log.Errorf("an error occured when inserting vulnerabilities for update: %s", err)
 		return false
 	}
-	osVuls = nil
 	appVuls = nil
 	rawFiles = nil
 
@@ -87,7 +89,58 @@ func xslateUbuntuUpstream(vuls []common.Vulnerability) []common.AppModuleVul {
 	return upstream
 }
 
-func fetchDistroVul() (bool, []*common.Vulnerability) {
+// writeFetcherVuls writes processed vulnerability data as newline-delimited JSON
+// to a temp file and returns the path. The in-memory slice becomes GC-eligible
+// once this returns.
+func writeFetcherVuls(vuls []*common.Vulnerability) (string, error) {
+	f, err := os.CreateTemp("", "fetcher-vul-*.json")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	bw := bufio.NewWriter(f)
+	enc := json.NewEncoder(bw)
+	ok := false
+	defer func() {
+		f.Close()
+		if !ok {
+			os.Remove(name)
+		}
+	}()
+	for _, v := range vuls {
+		if err := enc.Encode(v); err != nil {
+			return "", err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return "", err
+	}
+	ok = true
+	return name, nil
+}
+
+// streamFetcherVuls calls fn for each vulnerability decoded from path.
+// Only one Vulnerability is decoded into memory at a time.
+func streamFetcherVuls(path string, fn func(*common.Vulnerability) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	for dec.More() {
+		var v common.Vulnerability
+		if err := dec.Decode(&v); err != nil {
+			return err
+		}
+		if err := fn(&v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fetchDistroVul() (bool, []string) {
 	log.Info()
 
 	parallelism := 2
@@ -122,17 +175,27 @@ func fetchDistroVul() (bool, []*common.Vulnerability) {
 		}(n, f)
 	}
 
-	// Collect results of updates.
-	var vuls []*common.Vulnerability
+	// Collect results: write each fetcher's output to disk immediately so the
+	// in-memory slice is freed rather than accumulated across all fetchers.
+	var vulFiles []string
 	for i := 0; i < len(fetchers); i++ {
 		resp := <-responseC
 		if resp != nil {
-			vuls = append(vuls, doVulnerabilitiesNamespacing(resp.Vulnerabilities)...)
+			processed := doVulnerabilitiesNamespacing(resp.Vulnerabilities)
+			path, err := writeFetcherVuls(processed)
+			if err != nil {
+				log.WithError(err).Error("Failed to write fetcher vulns to disk")
+				status = false
+			} else {
+				vulFiles = append(vulFiles, path)
+				log.WithFields(log.Fields{"path": path, "count": len(processed)}).Debug("Wrote fetcher vulns to disk")
+			}
+			// processed slice is GC-eligible here
 		}
 	}
 
 	close(responseC)
-	return status, vuls
+	return status, vulFiles
 }
 
 func fetchAppVul() (bool, []*common.AppModuleVul) {
@@ -348,72 +411,74 @@ func fixSeverityScore(feedSeverity common.Priority, maxCVSSv2, maxCVSSv3 *common
 	return severity
 }
 
-func assignMetadata(vuls []*common.Vulnerability, apps []*common.AppModuleVul) ([]*common.Vulnerability, []*common.AppModuleVul) {
+// assignMetadata streams distro vulnerabilities from disk files to avoid holding
+// all data in RAM simultaneously. Distro vulns are inserted directly into the
+// datastore per-file batch during pass 2, so the caller receives only app vulns.
+func assignMetadata(vulFiles []string, apps []*common.AppModuleVul, datastore Datastore) []*common.AppModuleVul {
 	cveMap := make(map[string]*common.NVDMetadata)
 	start := time.Now()
 	log.WithFields(log.Fields{
-		"distroVuls": len(vuls),
-		"appVuls":    len(apps),
+		"distroFiles": len(vulFiles),
+		"appVuls":     len(apps),
 	}).Info("Start assigning metadata")
 
-	// Use two loops to cross-reference metadata provided by all feeds and nvd
-
-	// first loop, for each cve merge meta with NVD
-	for i, v := range vuls {
-		cves := []common.CVE{common.CVE{Name: v.Name}}
-		if len(v.CVEs) > 0 {
-			cves = v.CVEs
-		}
-
-		for _, cve := range cves {
-			common.DEBUG_VULN(v, "pre distro")
-			key := fmt.Sprintf("%s:%s", v.Namespace, cve.Name)
-
-			// Lookup meta map first, if entry exists, means the NVD has been searched
-			if meta, ok := cveMap[key]; ok {
-				enrichDistroMeta(meta, v, &cve)
-			} else {
-				// lookup NVD and store the metadata
-				meta, ok := nvd.NVD.GetMetadata(cve.Name)
-				if ok {
-					enrichDistroMeta(meta, v, &cve)
-				} else {
-					meta = &common.NVDMetadata{
-						CVSSv3:           cve.CVSSv3,
-						CVSSv2:           cve.CVSSv2,
-						Severity:         v.Severity,
-						PublishedDate:    v.IssuedDate,
-						LastModifiedDate: v.LastModDate,
+	// ── PASS 1: distro — stream from files to build cveMap ──────────────────
+	distroProcessed := 0
+	for _, path := range vulFiles {
+		func() {
+			if err := streamFetcherVuls(path, func(v *common.Vulnerability) error {
+				cves := []common.CVE{{Name: v.Name}}
+				if len(v.CVEs) > 0 {
+					cves = v.CVEs
+				}
+				for _, cve := range cves {
+					common.DEBUG_VULN(v, "pre distro")
+					key := fmt.Sprintf("%s:%s", v.Namespace, cve.Name)
+					if meta, ok := cveMap[key]; ok {
+						enrichDistroMeta(meta, v, &cve)
+					} else {
+						meta, ok := nvd.NVD.GetMetadata(cve.Name)
+						if ok {
+							enrichDistroMeta(meta, v, &cve)
+						} else {
+							meta = &common.NVDMetadata{
+								CVSSv3:           cve.CVSSv3,
+								CVSSv2:           cve.CVSSv2,
+								Severity:         v.Severity,
+								PublishedDate:    v.IssuedDate,
+								LastModifiedDate: v.LastModDate,
+							}
+						}
+						cveMap[key] = meta
 					}
 				}
-
-				cveMap[key] = meta
+				distroProcessed++
+				if distroProcessed%10000 == 0 {
+					log.WithFields(log.Fields{
+						"phase":     "distro-pass1",
+						"processed": distroProcessed,
+						"cveMap":    len(cveMap),
+						"elapsed":   time.Since(start).String(),
+					}).Info("Assign metadata progress")
+				}
+				return nil
+			}); err != nil {
+				log.WithFields(log.Fields{"path": path, "error": err}).Error("Stream distro vuls pass1 failed")
 			}
-		}
-		if (i+1)%10000 == 0 {
-			log.WithFields(log.Fields{
-				"phase":     "distro-pass1",
-				"processed": i + 1,
-				"total":     len(vuls),
-				"cveMap":    len(cveMap),
-				"elapsed":   time.Since(start).String(),
-			}).Info("Assign metadata progress")
-		}
+		}()
 	}
 
+	// ── PASS 1: apps (in memory, smaller dataset) ────────────────────────────
 	for i, app := range apps {
 		cves := []string{app.VulName}
 		if len(app.CVEs) > 0 {
 			cves = append(cves, app.CVEs...)
 		}
-
 		for _, cve := range cves {
 			common.DEBUG_VULN(app, "pre app")
-			// Lookup meta map first, if entry exists, means the NVD has been searched
 			if meta, ok := cveMap[cve]; ok {
 				enrichAppMeta(meta, app)
 			} else {
-				// lookup NVD and store the metadata
 				meta, ok := nvd.NVD.GetMetadata(cve)
 				if ok {
 					enrichAppMeta(meta, app)
@@ -440,74 +505,89 @@ func assignMetadata(vuls []*common.Vulnerability, apps []*common.AppModuleVul) (
 		}
 	}
 
-	// second loop, assign the severity and score to the record
-	outVuls := make([]*common.Vulnerability, 0)
-	outApps := make([]*common.AppModuleVul, 0)
+	// Release NVD map between passes; cveMap now has all needed metadata.
+	nvd.NVD.Unload()
+	runtime.GC()
+	log.Info("NVD metadata unloaded before pass 2")
 
-	for i, v := range vuls {
-		cves := []common.CVE{common.CVE{Name: v.Name}}
-		if len(v.CVEs) > 0 {
-			cves = v.CVEs
-		}
-
-		// Use the score from the feed if available
-		cvss3 := v.CVSSv3
-		cvss2 := v.CVSSv2
-		for _, cve := range cves {
-			key := fmt.Sprintf("%s:%s", v.Namespace, cve.Name)
-			if meta, ok := cveMap[key]; ok {
-				if v.IssuedDate.IsZero() {
-					v.IssuedDate = meta.PublishedDate
+	// ── PASS 2: distro — stream from files, insert per-file batch ───────────
+	distroProcessed = 0
+	distroKept := 0
+	for _, path := range vulFiles {
+		var batch []*common.Vulnerability
+		func() {
+			if err := streamFetcherVuls(path, func(v *common.Vulnerability) error {
+				cves := []common.CVE{{Name: v.Name}}
+				if len(v.CVEs) > 0 {
+					cves = v.CVEs
 				}
-				if v.LastModDate.IsZero() {
-					v.LastModDate = meta.LastModifiedDate
+				cvss3 := v.CVSSv3
+				cvss2 := v.CVSSv2
+				for _, cve := range cves {
+					key := fmt.Sprintf("%s:%s", v.Namespace, cve.Name)
+					if meta, ok := cveMap[key]; ok {
+						if v.IssuedDate.IsZero() {
+							v.IssuedDate = meta.PublishedDate
+						}
+						if v.LastModDate.IsZero() {
+							v.LastModDate = meta.LastModifiedDate
+						}
+						if len(v.Description) == 0 {
+							v.Description = meta.Description
+						}
+						if len(v.Link) == 0 {
+							v.Link = meta.Link
+						}
+						if cvss3.Score == 0 {
+							cvss3 = meta.CVSSv3
+						}
+						if cvss2.Score == 0 {
+							cvss2 = meta.CVSSv2
+						}
+						if v.Severity == "" || v.Severity == common.Unknown {
+							v.Severity = meta.Severity
+						}
+					}
 				}
-				if len(v.Description) == 0 {
-					v.Description = meta.Description
+				severity := fixSeverityScore(v.Severity, &cvss2, &cvss3)
+				v.Severity = severity
+				v.CVSSv3 = cvss3
+				v.CVSSv2 = cvss2
+				if !IgnoreSeverity(v.Severity) {
+					batch = append(batch, v)
+					common.DEBUG_VULN(v, "post distro")
 				}
-				if len(v.Link) == 0 {
-					v.Link = meta.Link
+				distroProcessed++
+				if distroProcessed%10000 == 0 {
+					log.WithFields(log.Fields{
+						"phase":     "distro-pass2",
+						"processed": distroProcessed,
+						"kept":      distroKept + len(batch),
+						"elapsed":   time.Since(start).String(),
+					}).Info("Assign metadata progress")
 				}
-				if cvss3.Score == 0 {
-					cvss3 = meta.CVSSv3
-				}
-				if cvss2.Score == 0 {
-					cvss2 = meta.CVSSv2
-				}
-				if v.Severity == "" || v.Severity == common.Unknown {
-					v.Severity = meta.Severity
-				}
+				return nil
+			}); err != nil {
+				log.WithFields(log.Fields{"path": path, "error": err}).Error("Stream distro vuls pass2 failed")
 			}
-		}
-
-		severity := fixSeverityScore(v.Severity, &cvss2, &cvss3)
-		v.Severity = severity
-		v.CVSSv3 = cvss3
-		v.CVSSv2 = cvss2
-
-		if !IgnoreSeverity(v.Severity) {
-			outVuls = append(outVuls, v)
-
-			common.DEBUG_VULN(v, "post distro")
-		}
-		if (i+1)%10000 == 0 {
-			log.WithFields(log.Fields{
-				"phase":     "distro-pass2",
-				"processed": i + 1,
-				"total":     len(vuls),
-				"kept":      len(outVuls),
-				"elapsed":   time.Since(start).String(),
-			}).Info("Assign metadata progress")
+		}()
+		if len(batch) > 0 {
+			distroKept += len(batch)
+			if err := datastore.InsertDistroVulBatch(batch); err != nil {
+				log.WithError(err).Error("InsertDistroVulBatch failed")
+			}
+			batch = nil
+			runtime.GC()
 		}
 	}
 
+	// ── PASS 2: apps ─────────────────────────────────────────────────────────
+	outApps := make([]*common.AppModuleVul, 0)
 	for i, app := range apps {
 		cves := []string{app.VulName}
 		if len(app.CVEs) > 0 {
 			cves = append(cves, app.CVEs...)
 		}
-
-		// Use the score from the feed if available
 		cvss3 := common.CVSS{Vectors: app.VectorsV3, Score: app.ScoreV3}
 		cvss2 := common.CVSS{Vectors: app.Vectors, Score: app.Score}
 		for _, cve := range cves {
@@ -532,18 +612,14 @@ func assignMetadata(vuls []*common.Vulnerability, apps []*common.AppModuleVul) (
 				}
 			}
 		}
-
 		severity := fixSeverityScore(app.Severity, &cvss2, &cvss3)
-
 		app.Severity = severity
 		app.ScoreV3 = cvss3.Score
 		app.VectorsV3 = cvss3.Vectors
 		app.Score = cvss2.Score
 		app.Vectors = cvss2.Vectors
-
 		if !IgnoreSeverity(app.Severity) {
 			outApps = append(outApps, app)
-
 			common.DEBUG_VULN(app, "post app")
 		}
 		if (i+1)%1000 == 0 {
@@ -558,41 +634,50 @@ func assignMetadata(vuls []*common.Vulnerability, apps []*common.AppModuleVul) (
 	}
 
 	log.WithFields(log.Fields{
-		"distroOut": len(outVuls),
+		"distroOut": distroKept,
 		"appOut":    len(outApps),
 		"cveMap":    len(cveMap),
 		"elapsed":   time.Since(start).String(),
 	}).Info("Finished assigning metadata")
 
-	return outVuls, outApps
+	return outApps
 }
 
-// fetch get data from the registered fetchers, in parallel.
-func fetch(datastore Datastore) (bool, []*common.Vulnerability, []*common.AppModuleVul, []*common.RawFile) {
+// fetch gets data from the registered fetchers. Distro vulns are written to
+// disk as fetchers complete, then streamed through assignMetadata in two passes
+// and inserted directly into the datastore — they are never accumulated in RAM.
+func fetch(datastore Datastore) (bool, []*common.AppModuleVul, []*common.RawFile) {
 	status := true
 
-	status, osVuls := fetchDistroVul()
+	status, vulFiles := fetchDistroVul()
 	if !status {
-		return status, nil, nil, nil
+		return status, nil, nil
 	}
-	log.WithField("distroVuls", len(osVuls)).Info("Fetched distro vulnerabilities")
+	defer func() {
+		for _, path := range vulFiles {
+			os.Remove(path)
+		}
+	}()
+	log.WithField("distroFiles", len(vulFiles)).Info("Fetched distro vulnerabilities to disk")
+
+	runtime.GC() // release fetcher-internal allocations before NVD load
 
 	status, rawFiles := fetchRawData()
 	if !status {
-		return status, nil, nil, nil
+		return status, nil, nil
 	}
 	log.WithField("rawFiles", len(rawFiles)).Info("Fetched raw vulnerability files")
 
 	status, appVuls := fetchAppVul()
 	if !status {
-		return status, nil, nil, nil
+		return status, nil, nil
 	}
 	log.WithField("appVuls", len(appVuls)).Info("Fetched app vulnerabilities")
 
 	log.Info("Start loading NVD metadata")
 	if err := nvd.NVD.Load(); err != nil {
 		log.Errorf("an error occured when loading NVD: %s.", err)
-		return false, nil, nil, nil
+		return false, nil, nil
 	}
 	log.Info("Finished loading NVD metadata")
 
@@ -600,13 +685,12 @@ func fetch(datastore Datastore) (bool, []*common.Vulnerability, []*common.AppMod
 	log.WithField("appVuls", len(appVuls)).Info("Injected NVD whitelist apps")
 	correctAppAffectedVersion(appVuls)
 
-	vuls, apps := assignMetadata(osVuls, appVuls)
-	log.WithFields(log.Fields{
-		"distroVuls": len(vuls),
-		"appVuls":    len(apps),
-	}).Info("Fetch pipeline complete")
+	// assignMetadata streams distro vulns from disk and inserts them directly.
+	// NVD is unloaded inside assignMetadata between the two passes.
+	apps := assignMetadata(vulFiles, appVuls, datastore)
+	log.WithField("appVuls", len(apps)).Info("Fetch pipeline complete")
 
-	return status, vuls, apps, rawFiles
+	return status, apps, rawFiles
 }
 
 func injectNvdWhitelistApps(appVuls []*common.AppModuleVul) []*common.AppModuleVul {
